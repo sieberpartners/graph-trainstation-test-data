@@ -1,3 +1,5 @@
+import pandas as pd
+
 # Creating the synthetic test legacy data
 trainstation_legacy1 = {
     "StationID": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
@@ -23,3 +25,10 @@ trainstation_legacy3 = {
     "PlatformsCount": ['36', '15', '16', '24', '21', '14', '26', '15', '12', '13', '32', '14'],
     "Established": ['1864', '1868', '1871', '1931', '1851', '1975', '1847', '1889', '2012', '1900', '1849', '1905']
 }
+
+# Create three dfs from the three dicts above
+df1 = pd.DataFrame(trainstation_legacy1)
+df2 = pd.DataFrame(trainstation_legacy2)
+df3 = pd.DataFrame(trainstation_legacy3)
+
+dfs = [df1, df2, df3]
