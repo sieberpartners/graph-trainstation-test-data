@@ -1,4 +1,4 @@
-from langchain_core.messages import AnyMessage, ToolMessage, SystemMessage, AIMessage
+from langchain_core.messages import AnyMessage, ToolMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import tool
 from langchain_community.graphs import Neo4jGraph
@@ -7,31 +7,37 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated, Dict, Any
 from dotenv import load_dotenv
-from data import dfs
+from data import inventar_daten
 import operator
 
 load_dotenv()
 
-fachdatenmodell = """
-    Nodes:
-    - Origin(id, name)
-    - Station(id, name, platform_count, opened_year)
-    - City(id, name)
-    - Country(id, name)
-    Relationships:
-    - (Station)-[:IS_IN]->(City)
-    - (City)-[:IS_IN]->(Country)
-    - (Station)-[:ORIGINALLY_FROM]->(Origin)
-    - (City)-[:ORIGINALLY_FROM]->(Origin)
-    - (Country)-[:ORIGINALLY_FROM]->(Origin)
-"""
+fachdatenmodell = {
+    "version": "1.0",
+    "inhalt": """
+        Nodes:
+        - Origin(name)
+        - Station(name, platform_count, opened_year)
+        - City(name)
+        - Country(name)
+        - FDMVersion(number)
+        Relationships:
+        - (Station)-[:IS_IN]->(City)
+        - (City)-[:IS_IN]->(Country)
+        - (Station)-[:ORIGINALLY_FROM]->(Origin)
+        - (City)-[:ORIGINALLY_FROM]->(Origin)
+        - (Country)-[:ORIGINALLY_FROM]->(Origin)
+        - (Station)-[:HAS_VERSION]->(FDMVersion)
+        """
+}
 
 corrector_schema = [
     Schema("Station", "IS_IN", "City"),
     Schema("City", "IS_IN", "Country"),
     Schema("Station", "ORIGINALLY_FROM", "Origin"),
     Schema("City", "ORIGINALLY_FROM", "Origin"),
-    Schema("Country", "ORIGINALLY_FROM", "Origin")
+    Schema("Country", "ORIGINALLY_FROM", "Origin"),
+    Schema("Station", "HAS_VERSION", "FDMVersion")
 ]
 
 cypher_validation = CypherQueryCorrector(corrector_schema)
@@ -64,7 +70,7 @@ cypher_llm = graph_doc_prompt | llm
 def dict_to_cypher(original: Dict[str, Any]) -> str:
     """Transform the input dictionary into a Cypher query based on the existing knowledge graph schema."""
     input_str = str(original)
-    cypher_query = cypher_llm.invoke({"fachdatenmodell": fachdatenmodell, "existing_graph": graph.get_schema, "input": input_str})
+    cypher_query = cypher_llm.invoke({"fachdatenmodell": fachdatenmodell["inhalt"], "existing_graph": graph.get_schema, "input": input_str})
     return cypher_query
 
 @tool
@@ -144,14 +150,12 @@ agent = TrainstationAgent(llm, tools, system=system_message)
 example_row_2 = {"ID": 1, "Nom": "Gare du Nord", "Ville": "Paris", "Pays": "France", "Plateformes": 36, "Ouverture": 1864, "Origine": "trainstation_legacy2", "Coordonnees": "48.8809, 2.3550"}
 result = agent.graph.invoke({"messages": [], "current_row": example_row_1}) """
 
-counter1 = 0
-counter2 = 1
-for df in dfs:
-    print(df)
-    name = f"df{counter2}"
-    for _, row in df.iterrows():
-        if counter1 == 3 or counter1 == 13 or counter1 == 28:
+counter = 0
+for inventar_tabelle in inventar_daten:
+    name = "dfa" if 0 < counter < 11 else "itop" if 11 < counter < 22 else "legacy_system_x"
+    for _, row in inventar_tabelle.iterrows():
+        if counter == 3 or counter == 13 or counter == 28:
             row["Origin"] = name
+            row["FDM-Version"] = fachdatenmodell["version"]
             result = agent.graph.invoke({"messages": [], "current_row": row})
-        counter1 += 1
-    counter2 += 1
+        counter += 1
