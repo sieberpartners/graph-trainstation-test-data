@@ -1,16 +1,21 @@
-from langchain_core.messages import AnyMessage, ToolMessage, SystemMessage
+import operator
+from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
+from langchain_core.output_parsers.string import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import tool
 from langchain_community.graphs import Neo4jGraph
 from langchain_community.chains.graph_qa.cypher_utils import Schema, CypherQueryCorrector
-from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, END
-from typing import TypedDict, Annotated, Dict, Any
+from langchain_anthropic import ChatAnthropic 
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode, tools_condition, InjectedState
+from typing import TypedDict, Annotated, Sequence
 from dotenv import load_dotenv
-from data import inventar_daten
-import operator
 
 load_dotenv()
+
+class State(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+    existing_graph: str
 
 fachdatenmodell = {
     "version": "1.0",
@@ -41,121 +46,142 @@ corrector_schema = [
 ]
 
 cypher_validation = CypherQueryCorrector(corrector_schema)
-
 graph = Neo4jGraph()
+llm = ChatAnthropic(model="claude-3-5-sonnet-20240620")
 
-llm = ChatOpenAI(model_name="gpt-4o-mini")
+base_prompt = """
+You transform an input dictionary into a Cypher query to {action} an existing knowledge graph based on a predefined graph schema.
+Your task is to generate a Cypher query that {task_description}.
 
-graph_doc_prompt = PromptTemplate.from_template("""
-You are an AI agent tasked with transforming an input dictionary into a Cypher query based on a predefined graph schema and an existing knowledge graph.
-The Cypher query is supposed to update the knowledge graph based on the information in the input dictionary.
-Updating means adding, modifying or deleting nodes and relationships, depending on the input dictionary.
-The knowledge graph and therefore the Cypher query have to respect the schema at all times.
+The schema is as follows: {fachdatenmodell}
+The existing knowledge graph is as follows: {existing_graph}
+The input data {input_description} is the following: {input_data}
+Follow these rules to generate the Cypher query:
 
-The schema is as follows:
-{fachdatenmodell}
+{rules}
 
-The existing knowledge graph is as follows:
-{existing_graph}
+Only return the Cypher query. Do not describe anything.
+"""
 
-The input dictionary is the following:
-{input}
+extend_prompt = PromptTemplate.from_template(base_prompt).partial(
+    action="extend",
+    task_description="adds new nodes and relationships to the graph",
+    input_description="to be added",
+    rules="""
+Generate a Cypher query to add new nodes and relationships based on the input data.
+Use MERGE for nodes to avoid duplicates.
+Use CREATE for relationships if they don't exist.
+Ensure that all operations respect the predefined schema at all times.
+"""
+)
 
-Only return the cypher query. Do not describe anything.
-""")
+update_prompt = PromptTemplate.from_template(base_prompt).partial(
+    action="update",
+    task_description="modifies existing nodes and relationships in the graph",
+    input_description="for updating",
+    rules="""
+Generate a Cypher query to modify existing nodes or relationships based on the input data.
+Use MATCH to find the existing nodes/relationships.
+Use SET to update properties.
+If necessary, use CREATE to add new relationships between existing nodes.
+Ensure that all operations respect the predefined schema at all times.
+"""
+)
 
-cypher_llm = graph_doc_prompt | llm
+delete_prompt = PromptTemplate.from_template(base_prompt).partial(
+    action="delete parts of",
+    task_description="removes specified nodes and relationships from the graph",
+    input_description="specifying what to delete",
+    rules="""
+Generate a Cypher query to delete nodes or relationships based on the input data.
+Use MATCH to find the nodes/relationships to be deleted.
+Use DETACH DELETE for nodes (to remove connected relationships) or DELETE for relationships.
+Ensure that all operations respect the predefined schema at all times.
+Be cautious with deletions to maintain graph integrity.
+"""
+)
 
 @tool
-def dict_to_cypher(original: Dict[str, Any]) -> str:
-    """Transform the input dictionary into a Cypher query based on the existing knowledge graph schema."""
-    input_str = str(original)
-    cypher_query = cypher_llm.invoke({"fachdatenmodell": fachdatenmodell["inhalt"], "existing_graph": graph.get_schema, "input": input_str})
-    return cypher_query
+def extend_graph(input_data: str, state: Annotated[dict, InjectedState]) -> str:
+    """Extend the Neo4j graph with new nodes and relationships based on the input data."""
+    chain = extend_prompt | llm | StrOutputParser() | cypher_validation
+    cypher_query = chain.invoke({
+        "fachdatenmodell": fachdatenmodell["inhalt"], 
+        "existing_graph": state["existing_graph"], 
+        "input_data": input_data
+    })
+    result = graph.query(cypher_query)
+    return f"Graph extended successfully. Result: {result}"
 
 @tool
-def update_graph(query: str) -> str:
-    """Update existing nodes and relationships in the neo4j graph with the provided Cypher query"""
-    try:
-        result = graph.query(cypher_validation(query))
-        return f"Graph updated successfully. Result: {result}"
-    except Exception as e:
-        return f"Error updating graph: {str(e)}"
+def update_graph(input_data: str, state: Annotated[dict, InjectedState]) -> str:
+    """Update existing nodes and relationships in the Neo4j graph based on the input data."""
+    chain = update_prompt | llm | cypher_validation
+    cypher_query = chain.invoke({
+        "fachdatenmodell": fachdatenmodell["inhalt"], 
+        "existing_graph": state["existing_graph"], 
+        "input_data": input_data
+    })
+    result = graph.query(cypher_query)
+    return f"Graph updated successfully. Result: {result}"
 
-tools = [dict_to_cypher, update_graph]
+@tool
+def delete_graph(input_data: str, state: Annotated[dict, InjectedState]) -> str:
+    """Delete specified nodes and relationships from the Neo4j graph based on the input data."""
+    chain = delete_prompt | llm | cypher_validation
+    cypher_query = chain.invoke({
+        "fachdatenmodell": fachdatenmodell["inhalt"], 
+        "existing_graph": state["existing_graph"], 
+        "input_data": input_data
+    })
+    result = graph.query(cypher_query)
+    return f"Graph deleted successfully. Result: {result}"
 
-# Define the state
-class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], operator.add]
-    current_row: Dict[str, Any]
+tools = [extend_graph, update_graph, delete_graph]
+tool_node = ToolNode(tools)
+bound_model = llm.bind_tools(tools)
 
-class TrainstationAgent:
-    def __init__(self, model, tools, system=""):
-        self.system = system
-        graph = StateGraph(AgentState)
-        graph.add_node("transform_input", self.transform_input)
-        graph.add_node("llm", self.call_llm)
-        graph.add_node("action", self.take_action)
-        graph.add_edge("transform_input", "llm")
-        graph.add_conditional_edges(
-            "llm",
-            self.exists_action,
-            {True: "action", False: END}
-        )
-        graph.add_edge("action", "llm")
-        graph.set_entry_point("transform_input")
-        self.graph = graph.compile()
-        self.tools = {t.name: t for t in tools}
-        self.model = model.bind_tools(tools)
+system_prompt = """
+You are an intelligent system responsible for analyzing input data and deciding how to modify a knowledge graph.
+Your task is to determine whether the given input should result in extending, updating, or deleting parts of an existing graph.
+You will be provided with the following information:
 
-    def exists_action(self, state: AgentState):
-        result = state['messages'][-1]
-        return len(result.tool_calls) > 0
+A predefined data schema: {fachdatenmodell}
+The existing knowledge graph: {existing_graph}
 
-    def transform_input(self, state: AgentState):
-        result = self.tools['dict_to_cypher'].invoke(input={"original": state['current_row']})
-        print(f"Transformed input: {result}")
-        return {'messages': [result]}
+Based on this information, you must consider the input data and decide on the appropriate action to take.
+Carefully compare the input data with the existing graph.
+Consider the graph schema to ensure your decision will maintain the integrity of the graph structure.
+If the input contains a mix of new and existing information, update rather than extend.
+Only delete something when there's a clear indication that information should be removed.
+If you're unsure, lean towards update as it's generally safer than delete.
+"""
 
-    def call_llm(self, state: AgentState):
-        messages = state['messages']
-        if self.system and type(messages[0]) != SystemMessage:
-            messages.insert(0, SystemMessage(content=self.system))
-        message = self.model.invoke(messages)
-        return {'messages': [message]}
+def create_system_message(fachdatenmodell, existing_graph):
+    return SystemMessage(content=system_prompt.format(
+        fachdatenmodell=fachdatenmodell,
+        existing_graph=existing_graph
+    ))
+
+def reflect(state: State):
+    messages = state["messages"]
     
-    def take_action(self, state: AgentState):
-        tool_calls = state['messages'][-1].tool_calls
-        results = []
-        for t in tool_calls:
-            print(f"Calling: {t}")
-            if t['name'] not in self.tools:
-                print("\n ....bad tool name....")
-                result = "bad tool name, retry"
-            elif t['name'] == 'dict_to_cypher':
-                result = self.tools['dict_to_cypher'].invoke(input={"original": state['current_row']})
-            elif t['name'] == 'update_graph':
-                result = self.tools['update_graph'].invoke(input={"query": t['args']['query']})
-                print(f"Query: {t['args']['query']}")
-            results.append(ToolMessage(tool_call_id=t['id'], name=t['name'], content=str(result)))
-        print("Back to the model!")
-        return {'messages': results}
+    if not messages or not isinstance(messages[0], SystemMessage):
+        system_message = create_system_message(fachdatenmodell, state["existing_graph"])
+        messages = [system_message] + messages
+        
+    response = bound_model.invoke(messages)
+    return {"messages": [response], "existing_graph": graph.get_schema if graph.get_schema else 'Empty graph.'}
 
-system_message = "You are an AI assistant processing train station data."
-
-agent = TrainstationAgent(llm, tools, system=system_message)
+workflow = StateGraph(State)
+workflow.add_node("reflect", reflect)
+workflow.add_node("act", tool_node)
+workflow.add_edge(START, "reflect")
+workflow.add_conditional_edges("reflect", tools_condition, {"tools": "act", END: END})
+workflow.add_edge("act", "reflect")
+langgraph = workflow.compile()
 
 # Usage example
-""" example_row_1 = {"StationID": 1, "StationName": "Gare du Nord", "Location": "Paris, France", "Platforms": 36, "OpenedYear": 1864, "Origin": "trainstation_legacy1"}
-example_row_2 = {"ID": 1, "Nom": "Gare du Nord", "Ville": "Paris", "Pays": "France", "Plateformes": 36, "Ouverture": 1864, "Origine": "trainstation_legacy2", "Coordonnees": "48.8809, 2.3550"}
-result = agent.graph.invoke({"messages": [], "current_row": example_row_1}) """
-
-counter = 0
-for inventar_tabelle in inventar_daten:
-    name = "dfa" if 0 < counter < 11 else "itop" if 11 < counter < 22 else "legacy_system_x"
-    for _, row in inventar_tabelle.iterrows():
-        if counter == 3 or counter == 13 or counter == 28:
-            row["Origin"] = name
-            row["FDM-Version"] = fachdatenmodell["version"]
-            result = agent.graph.invoke({"messages": [], "current_row": row})
-        counter += 1
+example_row_1 = {"StationID": 1, "StationName": "Gare du Nord", "Location": "Paris, France", "Platforms": 36, "OpenedYear": 1864, "Origin": "trainstation_legacy1"}
+human_message = HumanMessage(content=str(example_row_1))
+print(langgraph.invoke({"messages": [human_message]}))

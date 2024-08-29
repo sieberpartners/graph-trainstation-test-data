@@ -21,6 +21,7 @@ pydantic = "2.8.2"
 neo4j = "^5.23.1"
 pandas = "^2.2.2"
 numpy = "1.26.4"
+langchain-anthropic = "^0.1.23"
 
 [build-system]
 requires = ["poetry-core"]
